@@ -5,30 +5,22 @@ import datetime
 import kroger_cli.cli
 from kroger_cli.memoize import memoized
 from kroger_cli import helper
-from pyppeteer import launch
+import zendriver as zd
 
 
 class KrogerAPI:
-    browser_options = {
-        'headless': True,
-        'userDataDir': '.user-data',
-        'args': ['--blink-settings=imagesEnabled=false',  # Disable images for hopefully faster load-time
-                 '--no-sandbox']
-    }
-    headers = {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-                      'Chrome/81.0.4044.129 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
+    # zendriver configuration
+    headless = False
+    user_data_dir = '.user-data'
 
     def __init__(self, cli):
         self.cli: kroger_cli.cli.KrogerCLI = cli
 
     def complete_survey(self):
         # Cannot use headless mode here for some reason (sign-in cookie doesn't stick)
-        self.browser_options['headless'] = False
+        self.headless = False
         res = asyncio.get_event_loop().run_until_complete(self._complete_survey())
-        self.browser_options['headless'] = True
+        self.headless = True
 
         return res
 
@@ -48,27 +40,35 @@ class KrogerAPI:
         return asyncio.get_event_loop().run_until_complete(self._get_purchases_summary())
 
     async def _retrieve_feedback_url(self):
-        self.cli.console.print('Loading `My Purchases` page (to retrieve the Feedback’s Entry ID)')
+        self.cli.console.print('Loading `My Purchases` page (to retrieve the Feedback\'s Entry ID)')
 
-        # Model overlay pop up (might not exist)
+        # Modal overlay pop up (might not exist)
         # Need to click on it, as it prevents me from clicking on `Order Details` link
         try:
-            await self.page.waitForSelector('.ModalitySelectorDynamicTooltip--Overlay', {'timeout': 10000})
-            await self.page.click('.ModalitySelectorDynamicTooltip--Overlay')
+            overlay = await self.page.select('.ModalitySelectorDynamicTooltip--Overlay')
+            if overlay:
+                await overlay.click()
         except Exception:
             pass
 
         try:
             # `See Order Details` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button', {'timeout': 10000})
-            await self.page.click('.PurchaseCard-top-view-details-button a')
+            await self.page.wait(2)
+            details_btn = await self.page.select('.PurchaseCard-top-view-details-button a')
+            if details_btn:
+                await details_btn.click()
+                await self.page.wait(2)
+
             # `View Receipt` link
-            await self.page.waitForSelector('.PurchaseCard-top-view-details-button a', {'timeout': 10000})
-            await self.page.click('.PurchaseCard-top-view-details-button a')
-            content = await self.page.content()
+            receipt_btn = await self.page.select('.PurchaseCard-top-view-details-button a')
+            if receipt_btn:
+                await receipt_btn.click()
+                await self.page.wait(2)
+
+            content = await self.page.get_content()
         except Exception:
             link = 'https://www.' + self.cli.config['main']['domain'] + '/mypurchases'
-            self.cli.console.print('[bold red]Couldn’t retrieve the latest purchase, please make sure it exists: '
+            self.cli.console.print('[bold red]Couldn\'t retrieve the latest purchase, please make sure it exists: '
                                    '[link=' + link + ']' + link + '[/link][/bold red]')
             raise Exception
 
@@ -81,8 +81,9 @@ class KrogerAPI:
             entry_time = match[1]
             self.cli.console.print('Entry ID retrieved: ' + entry_id)
         except Exception:
-            self.cli.console.print('[bold red]Couldn’t retrieve Entry ID from the receipt, please make sure it exists: '
-                                   '[link=' + self.page.url + ']' + self.page.url + '[/link][/bold red]')
+            current_url = self.page.url if hasattr(self.page, 'url') else 'unknown'
+            self.cli.console.print('[bold red]Couldn\'t retrieve Entry ID from the receipt, please make sure it exists: '
+                                   '[link=' + current_url + ']' + current_url + '[/link][/bold red]')
             raise Exception
 
         entry = entry_id.split('-')
@@ -114,43 +115,78 @@ class KrogerAPI:
             await self.destroy()
             return None
 
-        await self.page.goto(url)
-        await self.page.waitForSelector('#Index_VisitDateDatePicker', {'timeout': 10000})
-        # We need to manually set the date, otherwise the validation fails
-        js = "() => {$('#Index_VisitDateDatePicker').datepicker('setDate', '" + survey_date + "');}"
-        await self.page.evaluate(js)
-        await self.page.click('#NextButton')
+        # Navigate to survey page
+        self.page = await self.browser.get(url)
+        await self.page
+        await self.page.wait(3)
+
+        # Wait for date picker and set the date
+        try:
+            date_picker = await self.page.select('#Index_VisitDateDatePicker')
+            if date_picker:
+                # We need to manually set the date, otherwise the validation fails
+                js = "() => {$('#Index_VisitDateDatePicker').datepicker('setDate', '" + survey_date + "');}"
+                await self.page.evaluate(js)
+
+            next_btn = await self.page.select('#NextButton')
+            if next_btn:
+                await next_btn.click()
+        except Exception:
+            pass
 
         for i in range(35):
-            current_url = self.page.url
+            await self.page.wait(2)
+            current_url = self.page.url if hasattr(self.page, 'url') else ''
+
             try:
-                await self.page.waitForSelector('#NextButton', {'timeout': 5000})
+                next_btn = await self.page.select('#NextButton')
+                if not next_btn:
+                    if 'Finish' in current_url:
+                        await self.destroy()
+                        return True
+                    continue
+
+                await self.page.evaluate(helper.get_survey_injection_js(self.cli.config))
+                await next_btn.click()
             except Exception:
                 if 'Finish' in current_url:
                     await self.destroy()
                     return True
-            await self.page.evaluate(helper.get_survey_injection_js(self.cli.config))
-            await self.page.click('#NextButton')
 
         await self.destroy()
         return False
 
     async def _get_account_info(self):
-        signed_in = await self.sign_in_routine()
+        # Sign in and redirect to account/update page which has profile info
+        signed_in = await self.sign_in_routine(redirect_url='/account/update', contains=['Profile Information'])
         if not signed_in:
             await self.destroy()
             return None
 
         self.cli.console.print('Loading profile info..')
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/accountmanagement/api/profile')
-        try:
-            content = await self.page.content()
-            profile = self._get_json_from_page_content(content)
-            user_id = profile['userId']
-        except Exception:
-            profile = None
-        await self.destroy()
+        await self.page.wait(2)
 
+        profile = {}
+        try:
+            # Scrape profile data from the page using data-qa selectors
+            email_elem = await self.page.find('[data-qa="Current Email: -value"]')
+            if email_elem:
+                profile['emailAddress'] = email_elem.text
+
+            card_elem = await self.page.find('[data-qa="Current Value Card Number: -value"]')
+            if card_elem:
+                profile['loyaltyCardNumber'] = card_elem.text
+
+            alt_id_elem = await self.page.find('[data-qa="Current Alt ID: -value"]')
+            if alt_id_elem:
+                profile['alternateId'] = alt_id_elem.text
+
+        except Exception as e:
+            print("EXCEPTION")
+            print(e)
+            profile = None
+
+        await self.destroy()
         return profile
 
     async def _get_points_balance(self):
@@ -160,9 +196,10 @@ class KrogerAPI:
             return None
 
         self.cli.console.print('Loading points balance..')
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/accountmanagement/api/points-summary')
+        self.page = await self.browser.get('https://www.' + self.cli.config['main']['domain'] + '/accountmanagement/api/points-summary')
+        await self.page
         try:
-            content = await self.page.content()
+            content = await self.page.get_content()
             balance = self._get_json_from_page_content(content)
             program_balance = balance[0]['programBalance']['balance']
         except Exception:
@@ -189,12 +226,20 @@ class KrogerAPI:
         """
 
         self.cli.console.print('[italic]Applying the coupons, please wait..[/italic]')
-        await self.page.keyboard.press('Escape')
+
+        # Dismiss any popup by pressing Escape
+        try:
+            body = await self.page.select('body')
+            if body:
+                await body.send_keys(zd.SpecialKeys.ESCAPE)
+        except Exception:
+            pass
+
         for i in range(6):
             await self.page.evaluate(js)
-            await self.page.keyboard.press('End')
-            await self.page.waitFor(1000)
-        await self.page.waitFor(3000)
+            await self.page.scroll_down(500)
+            await self.page.wait(1)
+        await self.page.wait(3)
         await self.destroy()
         self.cli.console.print('[bold]Coupons successfully clipped to your account! :thumbs_up:[/bold]')
 
@@ -205,9 +250,10 @@ class KrogerAPI:
             return None
 
         self.cli.console.print('Loading your purchases..')
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/mypurchases/api/v1/receipt/summary/by-user-id')
+        self.page = await self.browser.get('https://www.' + self.cli.config['main']['domain'] + '/mypurchases/api/v1/receipt/summary/by-user-id')
+        await self.page
         try:
-            content = await self.page.content()
+            content = await self.page.get_content()
             data = self._get_json_from_page_content(content)
         except Exception:
             data = None
@@ -216,14 +262,19 @@ class KrogerAPI:
         return data
 
     async def init(self):
-        self.browser = await launch(self.browser_options)
-        self.page = await self.browser.newPage()
-        await self.page.setExtraHTTPHeaders(self.headers)
-        await self.page.setViewport({'width': 700, 'height': 0})
+        # Start browser with user_data_dir for cookie persistence
+        self.browser = await zd.start(
+            headless=self.headless,
+            user_data_dir=self.user_data_dir
+        )
+        self.page = None  # Page is created on first navigation
 
     async def destroy(self):
-        await self.page.close()
-        await self.browser.close()
+        if self.browser:
+            await self.browser.stop()
+            # Allow Chrome to save profile/cookie data before exiting
+            import asyncio
+            await asyncio.sleep(1)
 
     async def sign_in_routine(self, redirect_url='/account/update', contains=None):
         if contains is None and redirect_url == '/account/update':
@@ -233,9 +284,9 @@ class KrogerAPI:
         self.cli.console.print('[italic]Signing in.. (please wait, it might take awhile)[/italic]')
         signed_in = await self.sign_in(redirect_url, contains)
 
-        if not signed_in and self.browser_options['headless']:
+        if not signed_in and self.headless:
             self.cli.console.print('[red]Sign in failed. Trying one more time..[/red]')
-            self.browser_options['headless'] = False
+            self.headless = False
             await self.destroy()
             await self.init()
             signed_in = await self.sign_in(redirect_url, contains)
@@ -247,25 +298,61 @@ class KrogerAPI:
         return signed_in
 
     async def sign_in(self, redirect_url, contains):
-        timeout = 20000
-        if not self.browser_options['headless']:
-            timeout = 60000
-        await self.page.goto('https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url)
-        await self.page.click('#SignIn-emailInput', {'clickCount': 3})  # Select all in the field
-        await self.page.type('#SignIn-emailInput', self.cli.username)
-        await self.page.click('#SignIn-passwordInput', {'clickCount': 3})
-        await self.page.type('#SignIn-passwordInput', self.cli.password)
-        await self.page.keyboard.press('Enter')
+        timeout = 20 if self.headless else 10  # seconds
+
+        # Navigate to sign-in page
+        sign_in_url = 'https://www.' + self.cli.config['main']['domain'] + '/signin?redirectUrl=' + redirect_url
+        self.page = await self.browser.get(sign_in_url)
+        await self.page
+        await self.page.wait(2)
+
         try:
-            await self.page.waitForNavigation(timeout=timeout)
+            # Dismiss any popups that may appear
+            try:
+                dismissbtn = await self.page.find('Dismiss', timeout=3)
+                if dismissbtn:
+                    await dismissbtn.click()
+            except Exception:
+                pass
+
+            try:
+                closepop = await self.page.find('Close pop-up', timeout=2)
+                if closepop:
+                    await closepop.click()
+            except Exception:
+                pass
+
+            # Find and fill email field
+            email_field = await self.page.find('signInName')
+            print(email_field)
+            if email_field:
+                await email_field.click()
+                await email_field.clear_input()
+                await email_field.send_keys(self.cli.username)
+
+            # Find and fill password field
+            password_field = await self.page.find('password')
+            if password_field:
+                await password_field.click()
+                await password_field.clear_input()
+                await password_field.send_keys(self.cli.password)
+                await password_field.send_keys(zd.SpecialKeys.ENTER)
+
+            # Wait for navigation/login to complete
+            await self.page.wait(timeout)
+
         except Exception:
             return False
 
+        # Verify login success by checking page content
         if contains is not None:
-            html = await self.page.content()
-            for item in contains:
-                if item not in html:
-                    return False
+            try:
+                content = await self.page.get_content()
+                for item in contains:
+                    if item not in content:
+                        return False
+            except Exception:
+                return False
 
         return True
 

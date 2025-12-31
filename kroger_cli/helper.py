@@ -115,27 +115,32 @@ def process_purchases_summary(purchases):
 
 
 def map_account_info(config, account_info):
-    if account_info['firstName']:
+    # Handle fields that may or may not be present in scraped data
+    if account_info.get('firstName'):
         config['profile']['first_name'] = account_info['firstName']
-    if account_info['lastName']:
+    if account_info.get('lastName'):
         config['profile']['last_name'] = account_info['lastName']
-    if account_info['emailAddress']:
+    if account_info.get('emailAddress'):
         config['profile']['email_address'] = account_info['emailAddress']
-    if account_info['loyaltyCardNumber']:
+    if account_info.get('loyaltyCardNumber'):
         config['profile']['loyalty_card_number'] = account_info['loyaltyCardNumber']
-    if account_info['mobilePhoneNumber']:
+    if account_info.get('mobilePhoneNumber'):
         config['profile']['mobile_phone'] = account_info['mobilePhoneNumber']
+    if account_info.get('alternateId'):
+        config['profile']['alternate_id'] = account_info['alternateId']
 
-    if account_info['address']['addressLine1']:
-        config['profile']['address_line1'] = account_info['address']['addressLine1']
-    if account_info['address']['addressLine2']:
-        config['profile']['address_line2'] = account_info['address']['addressLine2']
-    if account_info['address']['city']:
-        config['profile']['city'] = account_info['address']['city']
-    if account_info['address']['stateCode']:
-        config['profile']['state'] = account_info['address']['stateCode']
-    if account_info['address']['zip']:
-        config['profile']['zip'] = account_info['address']['zip']
+    # Handle nested address fields safely
+    address = account_info.get('address', {})
+    if address.get('addressLine1'):
+        config['profile']['address_line1'] = address['addressLine1']
+    if address.get('addressLine2'):
+        config['profile']['address_line2'] = address['addressLine2']
+    if address.get('city'):
+        config['profile']['city'] = address['city']
+    if address.get('stateCode'):
+        config['profile']['state'] = address['stateCode']
+    if address.get('zip'):
+        config['profile']['zip'] = address['zip']
 
     return config
 
