@@ -89,6 +89,7 @@ class KrogerCLI:
             elif option == 8:
                 self.prompt_credentials()
             elif option == 9:
+                self.api.close()
                 return
 
             self.console.rule()
